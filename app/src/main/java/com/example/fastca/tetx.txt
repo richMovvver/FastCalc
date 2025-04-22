@@ -1,0 +1,1072 @@
+// AppDatabase.kt
+package com.example.fastca
+
+import androidx.room.Database
+import androidx.room.RoomDatabase
+
+// Аннотация Database определяет сущности (entities), версию БД и нужно ли экспортировать схему.
+// exportSchema = false - упрощение для разработки, для продакшена лучше true и настроить миграции.
+@Database(entities = [SquareData::class, CalculationData::class], version = 5, exportSchema = false)
+abstract class AppDatabase : RoomDatabase() {
+
+    // Абстрактный метод, который Room реализует для предоставления DAO.
+    abstract fun squareDao(): SquareDao
+    abstract fun calculationDao(): CalculationDao
+
+    // Компаньон объект не обязателен при использовании Hilt,
+    // так как Hilt будет управлять созданием экземпляра БД.
+}
+
+object AppDestinations {
+    const val SQUARE_GRID_ROUTE = "squareGrid"
+    const val SQUARE_DETAIL_ROUTE = "squareDetail"
+    const val SQUARE_ID_ARG = "squareId" // Имя аргумента
+    val squareDetailRouteWithArg = "$SQUARE_DETAIL_ROUTE/{$SQUARE_ID_ARG}"
+}
+
+package com.example.fastca
+
+import androidx.room.*
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface CalculationDao {
+
+    @Query("SELECT * FROM calculations WHERE squareId = :squareId ORDER BY createdAt ASC")
+    fun getCalculationsForSquare(squareId: String): Flow<List<CalculationData>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertCalculation(calculation: CalculationData)
+
+    @Update
+    suspend fun updateCalculation(calculation: CalculationData)
+
+    @Delete
+    suspend fun deleteCalculation(calculation: CalculationData)
+
+    // Можно добавить метод для удаления всех расчетов для квадрата, если нужно
+    // @Query("DELETE FROM calculations WHERE squareId = :squareId")
+    // suspend fun deleteCalculationsForSquare(squareId: String)
+}
+
+package com.example.fastca
+
+import androidx.room.Entity
+import androidx.room.ForeignKey
+import androidx.room.Index
+import androidx.room.PrimaryKey
+import java.util.UUID
+
+@Entity(
+    tableName = "calculations",
+    // Связываем с таблицей 'squares' по полю squareId
+    foreignKeys = [ForeignKey(
+        entity = SquareData::class,
+        parentColumns = ["id"], // Поле в родительской таблице (SquareData)
+        childColumns = ["squareId"], // Поле в этой таблице
+        onDelete = ForeignKey.CASCADE // При удалении SquareData удалить все связанные расчеты
+    )],
+    // Индекс для ускорения запросов по squareId
+    indices = [Index(value = ["squareId"])]
+)
+data class CalculationData(
+    @PrimaryKey val id: String = UUID.randomUUID().toString(),
+    val squareId: String, // Ссылка на родительский SquareData
+    val name: String = "",
+    val lengthMm: Double = 0.0, // Длина в мм
+    val widthMm: Double = 0.0,  // Ширина в мм
+    val count: Int = 1,          // Количество
+    val createdAt: Long = System.currentTimeMillis()
+) {
+    // Вычисляемое свойство для объема в кубических метрах (мм * мм * 1 / 1_000_000_000)
+    // Умножаем на count
+    val volumeM3: Double
+        get() = if (lengthMm > 0 && widthMm > 0 && count > 0) {
+            (lengthMm * widthMm * count) / 1_000_000.0 // Делим на 1 млн для м² и еще раз на 1000? Нет, просто 1 млн.
+            // Перепроверка: 1000мм * 1000мм = 1_000_000 мм² = 1 м².
+            // Значит, мм * мм / 1_000_000 = м².
+            // Объем = Площадь * Толщина. У нас нет толщины.
+            // Возможно, имелся в виду расчет площади?
+            // Если объем, нужна третья размерность (толщина/высота).
+            // Пока будем считать ПЛОЩАДЬ в м²: (lengthMm * widthMm * count) / 1_000_000.0
+            // Если нужен объем, добавьте поле thicknessMm и делите на 1_000_000_000.0
+            // Давайте пока сделаем площадь в м²
+            (lengthMm * widthMm * count) / 1_000_000.0
+        } else {
+            0.0
+        }
+
+    // Форматирование объема для отображения
+    fun getFormattedVolume(): String {
+        val vol = volumeM3
+        return if (vol == 0.0) {
+            "0.0" // <-- Показываем "0.0" вместо "0.000000"
+        } else {
+            String.format("%.2f", vol).replace(',', '.')
+        }
+    }
+}
+
+package com.example.fastca
+
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete // Иконка удаления
+import androidx.compose.material3.* // Используем Material 3 компоненты
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged // Импорт для отслеживания фокуса
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+
+/**
+ * Composable для отображения и редактирования одной строки расчета.
+ *
+ * @param calculation Данные текущей строки расчета.
+ * @param onUpdate Лямбда, вызываемая для обновления данных строки в ViewModel/Repository.
+ * @param onDelete Лямбда, вызываемая для удаления этой строки.
+ * @param modifier Модификатор для настройки внешнего вида строки.
+ */
+@Composable
+fun CalculationRow(
+    calculation: CalculationData,
+    onUpdate: (CalculationData) -> Unit,
+    onDelete: (CalculationData) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    // Локальное состояние для полей ввода.
+    // Используем remember с ключом calculation.id, чтобы состояние сбрасывалось
+    // при изменении ID (например, при удалении/добавлении строк в LazyColumn).
+    var nameState by remember(calculation.id) { mutableStateOf(calculation.name) }
+    var lengthState by remember(calculation.id) { mutableStateOf(calculation.lengthMm.toStringPreservingTrailingZero()) }
+    var widthState by remember(calculation.id) { mutableStateOf(calculation.widthMm.toStringPreservingTrailingZero()) }
+    var countState by remember(calculation.id) { mutableStateOf(calculation.count.toString()) }
+
+    // Эффект для синхронизации локального состояния с внешними данными,
+    // если объект calculation изменился (например, после обновления из другого источника).
+    LaunchedEffect(calculation) {
+        // Проверяем, чтобы не перезаписать ввод пользователя без необходимости
+        if (nameState != calculation.name) nameState = calculation.name
+        if (lengthState != calculation.lengthMm.toStringPreservingTrailingZero()) lengthState = calculation.lengthMm.toStringPreservingTrailingZero()
+        if (widthState != calculation.widthMm.toStringPreservingTrailingZero()) widthState = calculation.widthMm.toStringPreservingTrailingZero()
+        if (countState != calculation.count.toString()) countState = calculation.count.toString()
+    }
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth() // Занимает всю ширину
+            .padding(vertical = 4.dp) // Вертикальный отступ между строками
+            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)) // Слегка видимая граница строки
+            .padding(horizontal = 8.dp, vertical = 8.dp), // Внутренние отступы в строке
+        verticalAlignment = Alignment.CenterVertically, // Выравнивание элементов по вертикали
+        horizontalArrangement = Arrangement.spacedBy(4.dp) // Небольшое пространство между элементами
+    ) {
+        // --- Поле Имя ---
+        EditableTextField(
+            value = nameState,
+            onValueChange = { nameState = it }, // Обновляем локальное состояние при вводе
+            onLostFocus = { // Действие при потере фокуса
+                val trimmedName = nameState.trim() // Убираем пробелы по краям
+                // Обновляем в БД, только если значение действительно изменилось
+                if (trimmedName != calculation.name) {
+                    onUpdate(calculation.copy(name = trimmedName))
+                }
+                // Обновляем state, если были пробелы
+                if (nameState != trimmedName) nameState = trimmedName
+            },
+            modifier = Modifier.weight(1.5f), // Уменьшенный вес для имени
+            label = "Имя"
+        )
+
+        // --- Поле Длина ---
+        EditableNumberField(
+            value = lengthState,
+            onValueChange = { lengthState = it }, // Обновляем локальное состояние
+            onLostFocus = { // Действие при потере фокуса
+                val parsedValue = lengthState.toDoubleOrNull() // Пытаемся преобразовать в Double
+                if (parsedValue != null) { // Если успешно преобразовано
+                    // Обновляем в БД, если значение отличается от сохраненного
+                    if (parsedValue != calculation.lengthMm) {
+                        onUpdate(calculation.copy(lengthMm = parsedValue))
+                    }
+                    // Обновляем локальное состояние для корректного форматирования (e.g., "5." -> "5")
+                    lengthState = parsedValue.toStringPreservingTrailingZero()
+                } else { // Если введено невалидное значение
+                    // Сбрасываем локальное состояние к последнему сохраненному значению
+                    lengthState = calculation.lengthMm.toStringPreservingTrailingZero()
+                }
+            },
+            modifier = Modifier.weight(1.5f), // Увеличенный вес
+            label = "Длина"
+        )
+
+        // --- Поле Ширина --- (Логика аналогична Длине)
+        EditableNumberField(
+            value = widthState,
+            onValueChange = { widthState = it },
+            onLostFocus = {
+                val parsedValue = widthState.toDoubleOrNull()
+                if (parsedValue != null) {
+                    if (parsedValue != calculation.widthMm) {
+                        onUpdate(calculation.copy(widthMm = parsedValue))
+                    }
+                    widthState = parsedValue.toStringPreservingTrailingZero()
+                } else {
+                    widthState = calculation.widthMm.toStringPreservingTrailingZero()
+                }
+            },
+            modifier = Modifier.weight(1.5f), // Увеличенный вес
+            label = "Ширина"
+        )
+
+        // --- Поле Количество --- (Логика аналогична, но с Int и проверкой > 0)
+        EditableNumberField(
+            value = countState,
+            onValueChange = { countState = it },
+            onLostFocus = {
+                val parsedValue = countState.toIntOrNull() // Пытаемся преобразовать в Int
+                // Проверяем, что значение валидно (не null) и больше нуля
+                if (parsedValue != null && parsedValue > 0) {
+                    // Обновляем в БД, если значение отличается
+                    if (parsedValue != calculation.count) {
+                        onUpdate(calculation.copy(count = parsedValue))
+                    }
+                    // Обновляем локальное состояние (просто toString для Int)
+                    countState = parsedValue.toString()
+                } else { // Если введено невалидное значение (не число, 0 или меньше)
+                    // Сбрасываем к последнему сохраненному значению
+                    countState = calculation.count.toString()
+                }
+            },
+            modifier = Modifier.weight(1.5f), // Увеличенный вес
+            label = "Кол-во",
+            keyboardType = KeyboardType.Number // Используем числовую клавиатуру без десятичных знаков
+        )
+
+        // --- Отображение Площади (или Объема) ---
+        Text(
+            text = calculation.getFormattedVolume(), // Используем форматированную строку из модели
+            modifier = Modifier
+                .weight(1.0f) // Увеличенный вес
+                .padding(start = 4.dp), // Небольшой отступ слева
+            textAlign = TextAlign.End, // Выравнивание текста по правому краю
+            style = MaterialTheme.typography.bodyMedium // Стиль текста из темы
+        )
+
+        // --- Кнопка удаления строки ---
+        IconButton(
+            onClick = { onDelete(calculation) }, // Вызываем лямбду удаления при нажатии
+            modifier = Modifier.size(36.dp) // Явно задаем небольшой размер кнопке
+        ) {
+            Icon(
+                imageVector = Icons.Default.Delete, // Стандартная иконка корзины
+                contentDescription = "Удалить строку", // Описание для доступности
+                tint = MaterialTheme.colorScheme.error // Используем цвет ошибки из темы для акцента
+            )
+        }
+    }
+}
+
+/**
+ * Вспомогательный Composable для создания редактируемого текстового поля
+ * с использованием OutlinedTextField и обработкой потери фокуса.
+ */
+@Composable
+fun EditableTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    onLostFocus: () -> Unit,
+    modifier: Modifier = Modifier,
+    label: String,
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default
+) {
+    OutlinedTextField(
+        value = value, // Текущее значение поля
+        onValueChange = onValueChange, // Лямбда для обновления значения при вводе
+        modifier = modifier
+            // .height(IntrinsicSize.Min) // Убрали - используем стандартную высоту
+            .onFocusChanged { focusState -> // Отслеживаем изменение состояния фокуса
+                if (!focusState.isFocused) { // Если фокус был потерян
+                    onLostFocus() // Вызываем переданную лямбду
+                }
+            },
+        label = { Text(label, fontSize = 10.sp) }, // Маленький текст метки (Label)
+        singleLine = true, // Поле ввода будет однострочным
+        keyboardOptions = keyboardOptions, // Настройки клавиатуры (тип и т.д.)
+        textStyle = LocalTextStyle.current.copy(fontSize = 14.sp), // Размер шрифта внутри поля
+        // Используем стандартные contentPadding для OutlinedTextField
+        // contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp) // Убрали
+    )
+}
+
+/**
+ * Вспомогательный Composable для создания редактируемого числового поля.
+ * Обертка над EditableTextField с фильтрацией ввода и настройкой клавиатуры.
+ */
+@Composable
+fun EditableNumberField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    onLostFocus: () -> Unit,
+    modifier: Modifier = Modifier,
+    label: String,
+    // Тип клавиатуры по умолчанию - для десятичных чисел
+    keyboardType: KeyboardType = KeyboardType.Decimal
+) {
+    EditableTextField( // Используем базовый EditableTextField
+        value = value,
+        onValueChange = { newValue ->
+            // Фильтруем ввод: разрешаем только цифры, точку и запятую
+            val filtered = newValue.filter { it.isDigit() || it == '.' || it == ',' }
+            // Заменяем запятую на точку для унификации перед сохранением/парсингом
+            onValueChange(filtered.replace(',', '.'))
+        },
+        onLostFocus = onLostFocus,
+        modifier = modifier,
+        label = label,
+        // Передаем объект KeyboardOptions с указанным типом клавиатуры
+        keyboardOptions = KeyboardOptions(keyboardType = keyboardType)
+    )
+}
+
+/**
+ * Расширение для Double, чтобы преобразовать его в строку,
+ * удаляя ".0" в конце, если число целое.
+ * Например: 5.0 -> "5", 5.5 -> "5.5"
+ */
+fun Double.toStringPreservingTrailingZero(): String {
+    val str = this.toString()
+    return if (str.endsWith(".0")) str.substring(0, str.length - 2) else str
+}
+
+// DatabaseModule.kt
+package com.example.fastca
+
+import android.content.Context
+import androidx.room.Room
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase // Нужен для миграции
+import dagger.Module
+import dagger.Provides
+import dagger.hilt.InstallIn
+import dagger.hilt.android.qualifiers.ApplicationContext
+import dagger.hilt.components.SingletonComponent
+import javax.inject.Singleton
+
+// --- ОПРЕДЕЛЯЕМ МИГРАЦИЮ ---
+val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // Добавляем новую колонку colorArgb типа INTEGER.
+        // Она не может быть NULL.
+        // Устанавливаем значение по умолчанию для существующих строк
+        // (например, белый цвет).
+        //db.execSQL("ALTER TABLE squares ADD COLUMN colorArgb INTEGER NOT NULL DEFAULT ${Color.White.toArgb()}")
+        db.execSQL("ALTER TABLE squares ADD COLUMN colorArgb INTEGER")
+    }
+}
+// --- НОВАЯ МИГРАЦИЯ с версии 2 на 3 ---
+val MIGRATION_2_3 = object : Migration(2, 3) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // 1. Создаем временную таблицу с новой схемой (без colorArgb)
+        db.execSQL("""
+            CREATE TABLE squares_new (
+                id TEXT NOT NULL PRIMARY KEY
+            )
+        """.trimIndent())
+
+        // 2. Копируем данные из старой таблицы в новую (только столбец id)
+        db.execSQL("""
+            INSERT INTO squares_new (id)
+            SELECT id FROM squares
+        """.trimIndent())
+
+        // 3. Удаляем старую таблицу
+        db.execSQL("DROP TABLE squares")
+
+        // 4. Переименовываем новую таблицу в оригинальное имя
+        db.execSQL("ALTER TABLE squares_new RENAME TO squares")
+    }
+}
+
+val MIGRATION_3_4 = object : Migration(3, 4) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS `calculations` (
+                `id` TEXT NOT NULL,
+                `squareId` TEXT NOT NULL,
+                `name` TEXT NOT NULL,
+                `lengthMm` REAL NOT NULL,
+                `widthMm` REAL NOT NULL,
+                `count` INTEGER NOT NULL,
+                PRIMARY KEY(`id`),
+                FOREIGN KEY(`squareId`) REFERENCES `squares`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE
+            )
+        """.trimIndent())
+        // Создаем индекс для внешнего ключа
+        db.execSQL("CREATE INDEX IF NOT EXISTS `index_calculations_squareId` ON `calculations` (`squareId`)")
+    }
+}
+
+val MIGRATION_4_5 = object : Migration(4, 5) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // Добавляем новую колонку createdAt
+        db.execSQL("ALTER TABLE calculations ADD COLUMN createdAt INTEGER NOT NULL DEFAULT 0")
+    }
+}
+// --------------------------
+
+@Module
+@InstallIn(SingletonComponent::class)
+object DatabaseModule {
+
+    @Provides
+    @Singleton
+    fun provideAppDatabase(@ApplicationContext context: Context): AppDatabase {
+        return Room.databaseBuilder(
+            context.applicationContext,
+            AppDatabase::class.java,
+            "fastca_database"
+        )
+            // --- ДОБАВЛЯЕМ МИГРАЦИЮ В БИЛДЕР ---
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+            // -----------------------------------
+            .build()
+    }
+
+    @Provides
+    @Singleton
+    fun provideSquareDao(database: AppDatabase): SquareDao {
+        return database.squareDao()
+    }
+
+    // --- ДОБАВЛЕНО: Предоставляем CalculationDao ---
+    @Provides
+    @Singleton
+    fun provideCalculationDao(database: AppDatabase): CalculationDao {
+        return database.calculationDao()
+    }
+}
+
+package com.example.fastca // Или ваш корневой пакет
+
+import android.app.Application
+import dagger.hilt.android.HiltAndroidApp
+
+@HiltAndroidApp
+class FastCaApplication : Application() {
+    // Можно оставить пустым для начала
+}
+
+// FastCaViewModel.kt
+package com.example.fastca
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope // Для запуска корутин
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+import androidx.compose.runtime.getValue // Для делегатов mutableStateOf
+import androidx.compose.runtime.mutableStateOf // Для состояния диалога
+import androidx.compose.runtime.setValue // Для делегатов mutableStateOf
+
+@HiltViewModel
+class FastCaViewModel @Inject constructor(
+    private val repository: SquareRepository // Внедряем репозиторий
+) : ViewModel() {
+
+    // --- Управление списком квадратов через Flow из репозитория ---
+    // Преобразуем Flow<List<SquareData>> в StateFlow<List<SquareData>>,
+    // чтобы UI мог легко его собирать как состояние Compose.
+    val squares: StateFlow<List<SquareData>> = repository.getAllSquares()
+        .stateIn(
+            scope = viewModelScope, // Область жизни корутин ViewModel
+            // Flow будет активен, пока есть подписчики + 5 секунд после исчезновения последнего
+            started = SharingStarted.WhileSubscribed(5000L),
+            initialValue = emptyList() // Начальное значение, пока данные не загрузились из БД
+        )
+
+    // --- Управление состоянием диалога удаления (остается как было) ---
+    var showDeleteDialog by mutableStateOf(false)
+        private set
+    var squareToDelete by mutableStateOf<SquareData?>(null)
+        private set
+
+    // --- Методы для взаимодействия с UI ---
+    fun addSquare() {
+        // Запускаем корутину для выполнения suspend функции репозитория
+        viewModelScope.launch {
+            repository.addSquare(SquareData()) // Создаем и добавляем новый квадрат
+        }
+    }
+
+    fun requestDelete(square: SquareData) {
+        squareToDelete = square
+        showDeleteDialog = true
+    }
+
+    fun confirmDelete() {
+        squareToDelete?.let { square ->
+            // Запускаем корутину для выполнения suspend функции репозитория
+            viewModelScope.launch {
+                repository.deleteSquare(square)
+            }
+        }
+        cancelDelete() // Скрываем диалог в любом случае
+    }
+
+    fun cancelDelete() {
+        showDeleteDialog = false
+        squareToDelete = null
+    }
+}
+
+package com.example.fastca
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Text
+import androidx.compose.ui.text.style.TextAlign
+import dagger.hilt.android.AndroidEntryPoint
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.fastca.ui.theme.FastCaTheme
+import androidx.navigation.NavController
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import androidx.navigation.NavType
+import androidx.navigation.navArgument
+
+@AndroidEntryPoint
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            FastCaApp()
+        }
+    }
+}
+
+@Composable
+fun FastCaApp() {
+    FastCaTheme {
+        // Создаем NavController
+        val navController = rememberNavController()
+
+        // NavHost определяет граф навигации
+        NavHost(
+            navController = navController,
+            // Начальный экран
+            startDestination = AppDestinations.SQUARE_GRID_ROUTE
+        ) {
+            // Экран сетки квадратов
+            composable(route = AppDestinations.SQUARE_GRID_ROUTE) {
+                // Передаем navController в FastCaScreen
+                FastCaScreen(navController = navController)
+            }
+
+            // Экран детализации квадрата
+            composable(
+                route = AppDestinations.squareDetailRouteWithArg,
+                arguments = listOf(navArgument(AppDestinations.SQUARE_ID_ARG) {
+                    type = NavType.StringType // Указываем тип аргумента
+                })
+            ) { backStackEntry ->
+                // Извлекаем аргумент (ID квадрата)
+                val squareId = backStackEntry.arguments?.getString(AppDestinations.SQUARE_ID_ARG)
+                // !! Важно: обработать случай, если ID не пришел (хотя не должен при правильной навигации)
+                if (squareId != null) {
+                    SquareDetailScreen(
+                        navController = navController
+                    )
+                } else {
+                    // Можно показать ошибку или вернуться назад
+                    navController.popBackStack()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun FastCaScreen(
+    navController: NavController, // <-- Добавить NavController как параметр
+    viewModel: FastCaViewModel = hiltViewModel()
+) {
+    val squares by viewModel.squares.collectAsStateWithLifecycle()
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+    ) {
+        Text(
+            text = "FastCa",
+            style = MaterialTheme.typography.titleLarge.copy(
+                fontFamily = FontFamily.Cursive,
+                fontSize = 32.sp
+            ),
+            color = MaterialTheme.colorScheme.onBackground,
+            modifier = Modifier
+                .align(Alignment.CenterHorizontally)
+                .padding(24.dp)
+        )
+
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
+            modifier = Modifier.weight(1f),
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
+        ) {
+            items(squares, key = { it.id }) { square ->
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(100.dp)
+                        .padding(8.dp)
+                        // ИСПРАВЛЕНО: Используем цвет поверхности из темы
+                        .background(MaterialTheme.colorScheme.surface)
+                        .border(1.dp, MaterialTheme.colorScheme.outline) // Уменьшил толщину для M3 стиля
+                        .pointerInput(Unit) {
+                            detectTapGestures(
+                                onLongPress = {
+                                    viewModel.requestDelete(square)
+                                },
+                                // --- ДОБАВЛЕНО: Обработка нажатия для навигации ---
+                                onTap = {
+                                    // Переходим на экран детали, передавая ID квадрата
+                                    navController.navigate("squareDetail/${square.id}")
+                                }
+                                // -------------------------------------------------
+                            )
+                        }
+                ) {
+                    Text(
+                        text = square.id.substring(0, 6),
+                        style = MaterialTheme.typography.bodyLarge, // Изменил стиль для примера
+                        // ИСПРАВЛЕНО: Используем цвет текста для поверхности
+                        color = MaterialTheme.colorScheme.onSurface,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+        }
+
+        // ... (Кнопка "Создать" и AlertDialog остаются без изменений по логике)
+        Button(
+            onClick = { viewModel.addSquare() },
+            colors = ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Text(
+                "Создать",
+                style = MaterialTheme.typography.labelLarge
+            )
+        }
+
+        if (viewModel.showDeleteDialog) {
+            AlertDialog(
+                onDismissRequest = { viewModel.cancelDelete() },
+                title = { Text("Удалить квадрат?") },
+                text = { Text("Вы точно хотите удалить этот квадрат?") },
+                confirmButton = {
+                    Button(onClick = { viewModel.confirmDelete() }) {
+                        Text("Да")
+                    }
+                },
+                dismissButton = {
+                    Button(onClick = { viewModel.cancelDelete() }) {
+                        Text("Нет")
+                    }
+                }
+            )
+        }
+    }
+}
+
+// SquareDao.kt
+package com.example.fastca
+
+import androidx.room.Dao
+import androidx.room.Delete
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.Query
+import kotlinx.coroutines.flow.Flow // Важно: используем Flow для реактивности
+
+@Dao
+interface SquareDao {
+
+    // Запрос для получения всех квадратов. Возвращает Flow,
+    // который будет автоматически обновлять UI при изменениях в таблице.
+    @Query("SELECT * FROM squares ORDER BY id ASC") // Добавим сортировку для предсказуемости
+    fun getAllSquares(): Flow<List<SquareData>>
+
+    // Метод для вставки нового квадрата.
+    // onConflict = OnConflictStrategy.REPLACE - если квадрат с таким id уже есть, он будет заменен.
+    // suspend - т.к. операции с БД должны выполняться в корутинах (вне основного потока).
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertSquare(square: SquareData)
+
+    // Метод для удаления квадрата.
+    // suspend - по той же причине.
+    @Delete
+    suspend fun deleteSquare(square: SquareData)
+
+    // Альтернативный метод удаления по ID (если удобнее)
+    // @Query("DELETE FROM squares WHERE id = :squareId")
+    // suspend fun deleteSquareById(squareId: String)
+
+    @Query("SELECT * FROM squares WHERE id = :squareId")
+    fun getSquareById(squareId: String): Flow<SquareData?> // Возвращаем Flow<SquareData?> (может не найти)
+}
+
+// SquareData.kt
+package com.example.fastca
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+import java.util.UUID
+
+@Entity(tableName = "squares")
+data class SquareData(
+    @PrimaryKey
+    val id: String = UUID.randomUUID().toString(),
+
+)
+
+// SquareDetailScreen.kt
+package com.example.fastca
+
+import SummaryRow
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Divider
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.navigation.NavController
+
+/**
+ * Экран для отображения деталей выбранного квадрата.
+ *
+ * @param navController Контроллер навигации для обработки действия "Назад".
+ * @param viewModel ViewModel для этого экрана, предоставляемая Hilt.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SquareDetailScreen(
+    navController: NavController, viewModel: SquareDetailViewModel = hiltViewModel()
+) {
+    // Собираем данные самого квадрата (для заголовка) и список расчетов
+    val squareData by viewModel.squareData.collectAsStateWithLifecycle()
+    val calculations by viewModel.calculations.collectAsStateWithLifecycle()
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(squareData?.id?.substring(0, 6) ?: "Детали") },
+                navigationIcon = {
+                    IconButton(onClick = { navController.popBackStack() }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад")
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                    titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                    navigationIconContentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            )
+        },
+        // УДАЛЕНО: floatingActionButton = { ... }
+    ) { paddingValues ->
+
+        // --- НОВЫЙ Column как основной контейнер ---
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(paddingValues) // Применяем отступы от Scaffold ко всему Column
+        ) {
+            LazyColumn(
+                modifier = Modifier
+                    // ЗАНИМАЕТ ВСЕ МЕСТО, КРОМЕ НИЖНИХ ЭЛЕМЕНТОВ
+                    .weight(1f)
+                    .padding(horizontal = 8.dp), // Горизонтальные отступы для списка
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                // ... (items для CalculationRow и сообщение "Нет данных" остаются здесь)
+                items(calculations, key = { it.id }) { calculation ->
+                    CalculationRow(
+                        calculation = calculation,
+                        onUpdate = { updatedCalc -> viewModel.updateCalculationRow(updatedCalc) },
+                        onDelete = { calcToDelete -> viewModel.deleteCalculationRow(calcToDelete) })
+                    Divider() // Разделитель между строками
+                }
+
+                if (calculations.isEmpty()) {
+                    item {
+                        Text(
+                            "Нет данных для расчета. Нажмите '+' чтобы добавить.",
+                            modifier = Modifier.padding(16.dp),
+                            textAlign = TextAlign.Center,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                }
+            } // --- Конец LazyColumn ---
+
+            // --- Место для строки итогов (добавим на следующем шаге) ---
+            SummaryRow(calculations = calculations) // <-- Вызов новой Composable
+
+            // --- НОВАЯ КНОПКА ДОБАВЛЕНИЯ (как на главном экране) ---
+            Button(
+                onClick = { viewModel.addCalculationRow() },
+                // Стилизуем под кнопку с главного экрана
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.primary, // Или surfaceVariant, если хотите серую
+                    contentColor = MaterialTheme.colorScheme.onPrimary // Или onSurfaceVariant
+                ), modifier = Modifier.fillMaxWidth() // Во всю ширину
+                    .padding(horizontal = 16.dp, vertical = 8.dp) // Отступы как у кнопки "Создать"
+            ) {
+                Text(
+                    "+ Добавить строку", // Текст кнопки
+                    style = MaterialTheme.typography.labelLarge // Стиль текста
+                )
+            }
+        } // --- Конец основного Column ---
+    }
+}
+
+package com.example.fastca
+
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@HiltViewModel
+class SquareDetailViewModel @Inject constructor(
+    private val repository: SquareRepository,
+    savedStateHandle: SavedStateHandle
+) : ViewModel() {
+
+    private val squareId: String = savedStateHandle.get<String>(AppDestinations.SQUARE_ID_ARG)
+        ?: throw IllegalArgumentException("Square ID not found")
+
+    // StateFlow для данных самого квадрата (может пригодиться для заголовка)
+    val squareData: StateFlow<SquareData?> = repository.getSquareById(squareId)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000L),
+            initialValue = null
+        )
+
+    // --- НОВОЕ: StateFlow для списка расчетов ---
+    val calculations: StateFlow<List<CalculationData>> = repository.getCalculationsForSquare(squareId)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000L),
+            initialValue = emptyList() // Начинаем с пустого списка
+        )
+
+    // --- НОВОЕ: Метод для добавления новой строки расчета ---
+    fun addCalculationRow() {
+        viewModelScope.launch {
+            // Создаем новую строку с ID текущего квадрата
+            val newCalculation = CalculationData(squareId = squareId)
+            repository.addCalculation(newCalculation)
+        }
+    }
+
+    // --- НОВОЕ: Метод для обновления существующей строки ---
+    fun updateCalculationRow(updatedCalculation: CalculationData) {
+        // Убедимся, что обновляем строку для правильного squareId (хотя id строки уникален)
+        if (updatedCalculation.squareId == squareId) {
+            viewModelScope.launch {
+                repository.updateCalculation(updatedCalculation)
+            }
+        } else {
+            // Обработка ошибки или логирование, если squareId не совпадает
+            println("Error: Attempted to update calculation with wrong squareId")
+        }
+    }
+
+    // --- НОВОЕ: Метод для удаления строки ---
+    fun deleteCalculationRow(calculationToDelete: CalculationData) {
+        viewModelScope.launch {
+            repository.deleteCalculation(calculationToDelete)
+        }
+    }
+}
+
+// SquareRepository.kt
+package com.example.fastca
+
+import kotlinx.coroutines.flow.Flow
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class SquareRepository @Inject constructor(
+    private val squareDao: SquareDao, // Внедряем SquareDao
+    private val calculationDao: CalculationDao // <-- ДОБАВЬТЕ ЭТУ СТРОКУ ДЛЯ ВНЕДРЕНИЯ CalculationDao
+) {
+
+    // --- Методы для SquareData ---
+    fun getAllSquares(): Flow<List<SquareData>> = squareDao.getAllSquares()
+    suspend fun addSquare(square: SquareData) { squareDao.insertSquare(square) }
+    suspend fun deleteSquare(square: SquareData) { squareDao.deleteSquare(square) }
+    fun getSquareById(squareId: String): Flow<SquareData?> = squareDao.getSquareById(squareId)
+
+    // --- Методы для CalculationData ---
+    // Теперь calculationDao будет доступен, так как он член класса
+    fun getCalculationsForSquare(squareId: String): Flow<List<CalculationData>> {
+        return calculationDao.getCalculationsForSquare(squareId)
+    }
+
+    suspend fun addCalculation(calculation: CalculationData) {
+        calculationDao.insertCalculation(calculation)
+    }
+
+    suspend fun updateCalculation(calculation: CalculationData) {
+        calculationDao.updateCalculation(calculation)
+    }
+
+    suspend fun deleteCalculation(calculation: CalculationData) {
+        calculationDao.deleteCalculation(calculation)
+    }
+}
+
+// Добавьте этот Composable в файл SquareDetailScreen.kt или создайте новый файл
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Divider
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface // Для фона с elevation
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import com.example.fastca.CalculationData
+
+/**
+ * Composable для отображения строки с итогами (общее количество и площадь).
+ * @param calculations Список строк расчета для вычисления итогов.
+ */
+@Composable
+fun SummaryRow(
+    calculations: List<CalculationData>,
+    modifier: Modifier = Modifier
+) {
+    // Вычисляем итоги только если список не пуст
+    val totalCount = if (calculations.isNotEmpty()) calculations.sumOf { it.count } else 0
+    val totalVolume = if (calculations.isNotEmpty()) calculations.sumOf { it.volumeM3 } else 0.0
+
+    // Используем Surface для фона и небольшого поднятия (elevation)
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp), // Отступы вокруг строки
+        shape = MaterialTheme.shapes.medium, // Скругленные углы
+        tonalElevation = 4.dp // Небольшая тень/поднятие
+    ) {
+        Column { // Используем Column для добавления разделителя сверху
+            Divider() // Разделитель перед строкой итогов
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp), // Внутренние отступы
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween // Распределяем элементы по краям
+            ) {
+                // Текст "Общее количество"
+                Text(
+                    text = "Общ кол-во:",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold // Жирный шрифт для акцента
+                )
+                // Значение общего количества
+                Text(
+                    text = totalCount.toString(),
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                )
+
+                // Текст "Общая площадь"
+                Text(
+                    text = "Общ площ (м²):",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                    modifier = Modifier.padding(start = 16.dp) // Отступ слева
+                )
+                // Значение общей площади (форматированное)
+                Text(
+                    text = String.format("%.2f", totalVolume).replace(',', '.'),
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                )
+            }
+        }
+    }
+}

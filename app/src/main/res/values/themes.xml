@@ -1,0 +1,15 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Базовая тема приложения. -->
+    <style name="Theme.FastCa" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- Настройте цвета, которые видны ДО отрисовки Compose -->
+        <!-- Например, цвет фона окна во время загрузки -->
+        <item name="android:windowBackground">@color/light_grey</item> <!-- Создайте этот цвет в colors.xml -->
+        <!-- Цвет статус-бара до настройки в Compose (можно сделать прозрачным) -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <!-- Делаем системные бары edge-to-edge -->
+        <item name="android:windowLightStatusBar" tools:targetApi="m">true</item> <!-- Иконки светлого статус-бара -->
+        <item name="android:windowLightNavigationBar" tools:targetApi="o_mr1">true</item> <!-- Иконки светлого нав. бара -->
+    </style>
+
+</resources>
